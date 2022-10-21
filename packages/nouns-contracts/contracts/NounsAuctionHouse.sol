@@ -27,9 +27,9 @@ pragma solidity ^0.8.6;
 import { PausableUpgradeable } from '@openzeppelin/contracts-upgradeable/security/PausableUpgradeable.sol';
 import { ReentrancyGuardUpgradeable } from '@openzeppelin/contracts-upgradeable/security/ReentrancyGuardUpgradeable.sol';
 import { OwnableUpgradeable } from '@openzeppelin/contracts-upgradeable/access/OwnableUpgradeable.sol';
-import { IERC20 } from '@openzeppelin/contracts/token/ERC20/IERC20.sol';
 import { INounsAuctionHouse } from './interfaces/INounsAuctionHouse.sol';
 import { INounsToken } from './interfaces/INounsToken.sol';
+import { IPOOP } from './interfaces/IPOOP.sol';
 import { IWETH } from './interfaces/IWETH.sol';
 
 contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, ReentrancyGuardUpgradeable, OwnableUpgradeable {
@@ -39,11 +39,17 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
     // The address of the WETH contract
     address public weth;
 
+    // The address of the POOP contract
+    address public poopToken;
+
     // The minimum amount of time left in an auction after a new bid is created
     uint256 public timeBuffer;
 
     // The minimum price accepted in an auction
     uint256 public reservePrice;
+
+    // The minimum price accepted in an auction
+    uint256 public reservePriceInPoop;
 
     // The minimum percentage difference between the last bid amount and the current bid
     uint8 public minBidIncrementPercentage;
@@ -62,8 +68,10 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
     function initialize(
         INounsToken _nouns,
         address _weth,
+        address _poopToken,
         uint256 _timeBuffer,
         uint256 _reservePrice,
+        uint256 _reservePriceInPoop,
         uint8 _minBidIncrementPercentage,
         uint256 _duration
     ) external initializer {
@@ -75,8 +83,10 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
 
         nouns = _nouns;
         weth = _weth;
+        poopToken = _poopToken;
         timeBuffer = _timeBuffer;
         reservePrice = _reservePrice;
+        reservePriceInPoop = _reservePriceInPoop;
         minBidIncrementPercentage = _minBidIncrementPercentage;
         duration = _duration;
     }
@@ -106,6 +116,7 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
 
         require(_auction.nounId == nounId, 'Noun not up for auction');
         require(block.timestamp < _auction.endTime, 'Auction expired');
+        require(_auction.currency == address(0), 'This auction is POOP round');
         require(msg.value >= reservePrice, 'Must send at least reservePrice');
         require(
             msg.value >= _auction.amount + ((_auction.amount * minBidIncrementPercentage) / 100),
@@ -128,7 +139,48 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
             auction.endTime = _auction.endTime = block.timestamp + timeBuffer;
         }
 
-        emit AuctionBid(_auction.nounId, msg.sender, msg.value, extended);
+        emit AuctionBid(_auction.nounId, msg.sender, _auction.currency, msg.value, extended);
+
+        if (extended) {
+            emit AuctionExtended(_auction.nounId, _auction.endTime);
+        }
+    }
+
+    /**
+     * @notice Create a bid for a Noun, with a given amount.
+     * @dev This contract only accepts payment in ETH.
+     */
+    function createBidInPoop(uint256 nounId, uint256 amount) external override nonReentrant {
+        INounsAuctionHouse.Auction memory _auction = auction;
+
+        require(_auction.nounId == nounId, 'Noun not up for auction');
+        require(block.timestamp < _auction.endTime, 'Auction expired');
+        require(_auction.currency == poopToken, 'This auction is ETH round');
+        require(amount >= reservePriceInPoop, 'Must send at least reservePrice');
+        require(IPOOP(poopToken).allowance(msg.sender, address(this)) >= amount, 'Poop is not allowed enough');
+        require(
+            amount >= _auction.amount + ((_auction.amount * minBidIncrementPercentage) / 100),
+            'Must send more than last bid by minBidIncrementPercentage amount'
+        );
+
+        address payable lastBidder = _auction.bidder;
+
+        // Refund the last bidder, if applicable
+        if (lastBidder != address(0)) {
+            IPOOP(poopToken).transfer(lastBidder, _auction.amount);
+        }
+
+        IPOOP(poopToken).transferFrom(msg.sender, address(this), amount);
+        auction.amount = amount;
+        auction.bidder = payable(msg.sender);
+
+        // Extend the auction if the bid was received within `timeBuffer` of the auction end time
+        bool extended = _auction.endTime - block.timestamp < timeBuffer;
+        if (extended) {
+            auction.endTime = _auction.endTime = block.timestamp + timeBuffer;
+        }
+
+        emit AuctionBid(_auction.nounId, msg.sender, _auction.currency, amount, extended);
 
         if (extended) {
             emit AuctionExtended(_auction.nounId, _auction.endTime);
@@ -199,13 +251,16 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
             uint256 startTime = block.timestamp;
             uint256 endTime = startTime + duration;
 
+            address currency = (nounId % 10) == 9 ? poopToken : address(0);
+
             auction = Auction({
-                nounId: nounId,
-                amount: 0,
-                startTime: startTime,
-                endTime: endTime,
-                bidder: payable(0),
-                settled: false
+            nounId: nounId,
+            currency: currency,
+            amount: 0,
+            startTime: startTime,
+            endTime: endTime,
+            bidder: payable(0),
+            settled: false
             });
 
             emit AuctionCreated(nounId, startTime, endTime);
@@ -234,10 +289,15 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
         }
 
         if (_auction.amount > 0) {
-            _safeTransferETHWithFallback(owner(), _auction.amount);
+            if (_auction.currency == address(0)) {
+                _safeTransferETHWithFallback(owner(), _auction.amount);
+            } else {
+                // burn POOP
+                IPOOP(poopToken).burn(_auction.amount);
+            }
         }
 
-        emit AuctionSettled(_auction.nounId, _auction.bidder, _auction.amount);
+        emit AuctionSettled(_auction.nounId, _auction.bidder, _auction.currency, _auction.amount);
     }
 
     /**
@@ -246,7 +306,7 @@ contract NounsAuctionHouse is INounsAuctionHouse, PausableUpgradeable, Reentranc
     function _safeTransferETHWithFallback(address to, uint256 amount) internal {
         if (!_safeTransferETH(to, amount)) {
             IWETH(weth).deposit{ value: amount }();
-            IERC20(weth).transfer(to, amount);
+            IWETH(weth).transfer(to, amount);
         }
     }
 

@@ -21,6 +21,8 @@ interface INounsAuctionHouse {
     struct Auction {
         // ID for the Noun (ERC721 token ID)
         uint256 nounId;
+        // Currency
+        address currency;
         // The current highest bid amount
         uint256 amount;
         // The time that the auction started
@@ -35,11 +37,11 @@ interface INounsAuctionHouse {
 
     event AuctionCreated(uint256 indexed nounId, uint256 startTime, uint256 endTime);
 
-    event AuctionBid(uint256 indexed nounId, address sender, uint256 value, bool extended);
+    event AuctionBid(uint256 indexed nounId, address sender, address currency, uint256 value, bool extended);
 
     event AuctionExtended(uint256 indexed nounId, uint256 endTime);
 
-    event AuctionSettled(uint256 indexed nounId, address winner, uint256 amount);
+    event AuctionSettled(uint256 indexed nounId, address winner, address currency, uint256 amount);
 
     event AuctionTimeBufferUpdated(uint256 timeBuffer);
 
@@ -52,6 +54,8 @@ interface INounsAuctionHouse {
     function settleCurrentAndCreateNewAuction() external;
 
     function createBid(uint256 nounId) external payable;
+
+    function createBidInPoop(uint256 nounId, uint256 amount) external;
 
     function pause() external;
 
